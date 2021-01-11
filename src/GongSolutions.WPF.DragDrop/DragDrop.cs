@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Linq;
+using System.Timers;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
@@ -114,8 +115,16 @@ namespace GongSolutions.Wpf.DragDrop
 
                 var adornment = new ContentPresenter { Content = dragInfo.Data, ContentTemplate = template };
 
-                var preview = new DragDropEffectPreview(rootElement, adornment, GetEffectAdornerTranslation(dragInfo.VisualSource), dropInfo.Effects, dropInfo.EffectText, dropInfo.DestinationText) { IsOpen = true };
-                return preview;
+                return new DragDropEffectPreview(
+                    rootElement, 
+                    adornment, 
+                    GetEffectAdornerTranslation(dragInfo.VisualSource), 
+                    dropInfo.Effects, 
+                    dropInfo.EffectText, 
+                    dropInfo.DestinationText) 
+                { 
+                    IsOpen = true 
+                };
             }
 
             return null;
@@ -348,6 +357,8 @@ namespace GongSolutions.Wpf.DragDrop
 
         private static void DragSourceOnTouchDown(object sender, TouchEventArgs e)
         {
+            _isTouchActive = true;
+
             _dragInfo = null;
 
             // Ignore the click if clickCount != 1 or the user has clicked on a scrollbar.
@@ -363,7 +374,37 @@ namespace GongSolutions.Wpf.DragDrop
 
             var dragInfo = new DragInfo(sender, e);
 
-            DragSourceDown(sender, dragInfo, e);
+            CreateHoldTouchDownCheckTimer(sender, e, dragInfo);
+        }
+
+        private static void CreateHoldTouchDownCheckTimer(object touchSender, TouchEventArgs touchInputEventArgs, DragInfo dragInfo)
+        {
+            _handleTouchTimer = new Timer(200);
+            _handleTouchTimer.Elapsed += (sender, e) =>
+            {
+                _handleTouchTimer.Stop();
+
+                Application.Current.Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (HasMoved(
+                        dragInfo.VisualSource, 
+                        dragInfo.DragStartPosition, 
+                        touchInputEventArgs.TouchDevice.GetTouchPoint((IInputElement)touchSender).Position))
+                    {
+                        return;
+                    }
+
+                    if (touchSender is ItemsControl itemsControl)
+                    {
+                        _scrollTouchItem = itemsControl;
+                        _scrollTouchItem.SetCurrentValue(ScrollViewer.PanningModeProperty, PanningMode.None);
+                    }
+
+                    DragSourceDown(touchSender, dragInfo, touchInputEventArgs);
+                }));
+            };
+
+            _handleTouchTimer.Start();
         }
 
         private static void DoMouseButtonDown(object sender, MouseButtonEventArgs e)
@@ -434,6 +475,17 @@ namespace GongSolutions.Wpf.DragDrop
 
         private static void DragSourceOnTouchUp(object sender, TouchEventArgs e)
         {
+            _isTouchActive = false;
+
+            _handleTouchTimer.Stop();
+            _handleTouchTimer.Dispose();
+
+            if (_scrollTouchItem != null)
+            {
+                _scrollTouchItem.SetCurrentValue(ScrollViewer.PanningModeProperty, PanningMode.Both);
+                _scrollTouchItem = null;
+            }
+
             DragSourceUp(sender, e.GetTouchPoint((IInputElement)sender).Position);
         }
 
@@ -473,10 +525,12 @@ namespace GongSolutions.Wpf.DragDrop
 
         private static void DragSourceOnTouchMove(object sender, TouchEventArgs e)
         {
+            _isTouchActive = e.TouchDevice.IsActive;
+
             if (_dragInfo != null && !_dragInProgress)
             {
                 // do nothing if mouse left/right button is released or the pointer is captured
-                if (_dragInfo.MouseButton == MouseButton.Left && !e.TouchDevice.IsActive)
+                if (_dragInfo.MouseButton == MouseButton.Left && !_isTouchActive)
                 {
                     _dragInfo = null;
                     return;
@@ -488,7 +542,7 @@ namespace GongSolutions.Wpf.DragDrop
 
         private static void DragSourceOnMouseMove(object sender, MouseEventArgs e)
         {
-            if (_dragInfo != null && !_dragInProgress)
+            if (_dragInfo != null && !_dragInProgress && !_isTouchActive)
             {
                 if (_dragInfo.MouseButton == MouseButton.Left && e.LeftButton == MouseButtonState.Released)
                 {
@@ -511,6 +565,7 @@ namespace GongSolutions.Wpf.DragDrop
         private static void DoDragSourceMove(object sender, Point position)
         {
             var dragInfo = _dragInfo;
+
             if (dragInfo != null && !_dragInProgress)
             {
                 // the start from the source
@@ -521,8 +576,7 @@ namespace GongSolutions.Wpf.DragDrop
 
                 // only if the sender is the source control and the mouse point differs from an offset
                 if (dragInfo.VisualSource == sender
-                    && (Math.Abs(position.X - dragStart.X) > DragDrop.GetMinimumHorizontalDragDistance(dragInfo.VisualSource) ||
-                        Math.Abs(position.Y - dragStart.Y) > DragDrop.GetMinimumVerticalDragDistance(dragInfo.VisualSource)))
+                    && HasMoved(dragInfo.VisualSource, position, dragStart))
                 {
                     dragInfo.RefreshSelectedItems(sender);
 
@@ -557,9 +611,10 @@ namespace GongSolutions.Wpf.DragDrop
                                         DragDropPreview?.Move(DragDropPreview.PlacementTarget.PointFromScreen(point));
                                         DragDropEffectPreview?.Move(DragDropEffectPreview.PlacementTarget.PointFromScreen(point));
                                     });
-
+                                
                                 var dragDropHandler = dragInfo.DragDropHandler ?? System.Windows.DragDrop.DoDragDrop;
                                 var dragDropEffects = dragDropHandler(dragInfo.VisualSource, dataObject, dragInfo.Effects);
+
                                 if (dragDropEffects == DragDropEffects.None)
                                 {
                                     dragHandler.DragCancelled();
@@ -588,7 +643,11 @@ namespace GongSolutions.Wpf.DragDrop
 
         private static void DragSourceOnQueryContinueDrag(object sender, QueryContinueDragEventArgs e)
         {
-            if (e.Action == DragAction.Cancel || e.EscapePressed || (e.KeyStates.HasFlag(DragDropKeyStates.LeftMouseButton) == false && e.KeyStates.HasFlag(DragDropKeyStates.RightMouseButton) == false))
+            if (e.Action == DragAction.Cancel 
+                || e.EscapePressed 
+                || (e.KeyStates.HasFlag(DragDropKeyStates.LeftMouseButton) == false 
+                && e.KeyStates.HasFlag(DragDropKeyStates.RightMouseButton) == false
+                && !_isTouchActive))
             {
                 DragDropPreview = null;
                 DragDropEffectPreview = null;
@@ -653,7 +712,7 @@ namespace GongSolutions.Wpf.DragDrop
             if (DragDropPreview is null && dragInfo is { })
             {
                 DragDropPreview = GetDragDropPreview(dropInfo, sender as UIElement);
-                DragDropPreview?.Move(e.GetPosition(DragDropPreview.PlacementTarget));
+                //DragDropPreview?.Move(e.GetPosition(DragDropPreview.PlacementTarget));
             }
 
             Scroll(dropInfo, e);
@@ -673,7 +732,7 @@ namespace GongSolutions.Wpf.DragDrop
                 // Display the adorner in the control's ItemsPresenter. If there is no 
                 // ItemsPresenter provided by the style, try getting hold of a
                 // ScrollContentPresenter and using that.
-                UIElement adornedElement = null;
+                UIElement adornedElement;
                 if (itemsControl is TabControl)
                 {
                     adornedElement = itemsControl.GetVisualDescendent<TabPanel>();
@@ -704,7 +763,7 @@ namespace GongSolutions.Wpf.DragDrop
                         var adornerBrush = GetDropTargetAdornerBrush(dropInfo.VisualTarget);
                         if (adornerBrush != null)
                         {
-                            adorner.Pen.Brush = adornerBrush;
+                            adorner.Pen.SetCurrentValue(Pen.BrushProperty, adornerBrush);
                         }
 
                         adorner.DropInfo = dropInfo;
@@ -815,6 +874,12 @@ namespace GongSolutions.Wpf.DragDrop
                    || HitTestUtilities.HitTest4DataGridTypes(sender, elementPosition);
         }
 
+        private static bool HasMoved(UIElement visualSource, Point previousPosition, Point newPosition)
+        {
+            return Math.Abs(newPosition.X - previousPosition.X) > DragDrop.GetMinimumHorizontalDragDistance(visualSource) ||
+                        Math.Abs(newPosition.Y - previousPosition.Y) > DragDrop.GetMinimumVerticalDragDistance(visualSource);
+        }
+
         private static DragDropPreview dragDropPreview;
 
         private static DragDropPreview DragDropPreview
@@ -860,5 +925,8 @@ namespace GongSolutions.Wpf.DragDrop
         private static DragInfo _dragInfo;
         private static bool _dragInProgress;
         private static object _clickSupressItem;
+        private static Timer _handleTouchTimer;
+        private static bool _isTouchActive;
+        private static ItemsControl _scrollTouchItem;
     }
 }
